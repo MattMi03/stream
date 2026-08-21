@@ -16,9 +16,9 @@ import urllib3
 import datetime
 
 # ==========================================
-# 屏蔽各种警告与证书提示
+# 屏蔽各种警告
 warnings.filterwarnings("ignore", category=UserWarning, module="customtkinter")
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning) # 屏蔽 HTTPS IP 访问时的证书警告
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 # ==========================================
@@ -27,8 +27,9 @@ ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
 def get_ffmpeg_path():
-    """获取 Windows 下的 ffmpeg.exe 路径 (支持 PyInstaller 打包)"""
-    exe_name = 'ffmpeg.exe'
+    """跨平台自动获取 ffmpeg 路径 (兼容 Mac/Win)"""
+    exe_name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+    
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, exe_name)
     local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), exe_name)
@@ -42,7 +43,7 @@ def get_ffmpeg_path():
 class StreamRecorderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("流媒体录像与云端分发工具 - Windows 业务版")
+        self.root.title("流媒体录像与云端分发工具 - 跨平台业务版")
         self.root.geometry("540x800")
         self.root.resizable(False, False)
 
@@ -95,7 +96,7 @@ class StreamRecorderApp:
         self.http_url_label = ctk.CTkLabel(port_frame, textvariable=self.http_url_var, font=ctk.CTkFont(size=11, weight="bold"), text_color="gray")
         self.http_url_label.pack(side="left", padx=15)
 
-        # ================= 云端回放平台同步模块 =================
+        # ================= 云端回放同步模块 =================
         cloud_frame = ctk.CTkFrame(self.main_frame, corner_radius=8, fg_color=("gray90", "gray15"))
         cloud_frame.pack(fill="x", pady=(0, 10), ipadx=10, ipady=10)
         
@@ -116,7 +117,7 @@ class StreamRecorderApp:
         ctk.CTkLabel(cloud_frame, text="密码:").grid(row=2, column=0, sticky="e", padx=5, pady=5)
         self.pwd_entry = ctk.CTkEntry(cloud_frame, width=140, show="*")
         self.pwd_entry.grid(row=2, column=1, sticky="w")
-        self.pwd_entry.insert(0, "12345678") 
+        self.pwd_entry.insert(0, "123456") 
 
         ctk.CTkLabel(cloud_frame, text="设备ID:").grid(row=2, column=2, sticky="e", padx=5)
         self.device_id_entry = ctk.CTkEntry(cloud_frame, width=100)
@@ -162,6 +163,8 @@ class StreamRecorderApp:
         def login_thread():
             try:
                 login_url = f"{base_url}/admin/apiauth/auth/login"
+                
+                # 【精确匹配后端 JSON 结构】
                 payload = {
                     "identifier": username,
                     "password": password,
@@ -169,7 +172,12 @@ class StreamRecorderApp:
                     "userType": 1
                 }
                 
-                resp = requests.post(login_url, json=payload, verify=False, timeout=5)
+                resp = requests.post(
+                    login_url, 
+                    json=payload, 
+                    verify=False, 
+                    timeout=5
+                )
                 result = resp.json()
                 
                 if resp.status_code == 200 and result.get("code") == 200:
@@ -178,12 +186,10 @@ class StreamRecorderApp:
                     self.root.after(0, lambda: self.upload_btn.configure(state="normal"))
                     self.root.after(0, lambda: messagebox.showinfo("成功", f"登录成功！\n获取到账号: {result['data']['name']} 的 Token"))
                 else:
-                    msg = result.get("msg", "未知错误")
-                    self.root.after(0, lambda: messagebox.showerror("登录失败", msg))
+                    self.root.after(0, lambda: messagebox.showerror("登录失败", result.get("msg", "未知错误")))
                     self.root.after(0, lambda: self.status_var.set("状态: 登录失败"))
             except Exception as e:
-                err_msg = str(e)
-                self.root.after(0, lambda: messagebox.showerror("网络错误", err_msg))
+                self.root.after(0, lambda: messagebox.showerror("网络错误", str(e)))
                 self.root.after(0, lambda: self.status_var.set("状态: 网络请求异常"))
                 
         threading.Thread(target=login_thread, daemon=True).start()
@@ -210,7 +216,7 @@ class StreamRecorderApp:
                     "Content-Type": "application/json"
                 }
                 
-                # 1. 获取上传凭证 (统一走 photos 路径)
+                # 1. 获取上传凭证
                 file_size = os.path.getsize(filepath)
                 file_name = os.path.basename(filepath)
                 token_payload = {
@@ -237,7 +243,7 @@ class StreamRecorderApp:
                     if resp_oss.status_code not in (200, 201):
                         raise Exception(f"OSS直传失败，HTTP状态码: {resp_oss.status_code}")
 
-                # 3. 绑定设备ID保存到录像回放表 (带上正确的网关前缀)
+                # 3. 绑定设备ID保存到录像回放表
                 self.root.after(0, lambda: self.status_var.set("状态: 文件上传成功，正在绑定录像回放记录..."))
                 
                 now = datetime.datetime.now()
@@ -249,17 +255,19 @@ class StreamRecorderApp:
                     "endTime": "23:59:59"
                 }
                 
+                # 【最终修正】：带上正确的网关前缀 /admin/apistudentaffair
                 save_url = f"{base_url}/admin/apistudentaffair/admin/videocheck/domain/playback/save"
-                resp_save = requests.post(save_url, json=save_payload, headers=headers, verify=False, timeout=5)
                 
+                # 确认是标准 POST 请求
+                resp_save = requests.post(save_url, json=save_payload, headers=headers, verify=False, timeout=5)
                 if resp_save.status_code == 200 and resp_save.json().get("code") == 200:
                     self.root.after(0, lambda: messagebox.showinfo("完美结束", f"✅ 视频上传成功！\n设备ID: {device_id}\n云端标识: {object_key}\n记录已成功保存到录像回放列表中！"))
                 else:
                     raise Exception(f"业务入库失败: {resp_save.text}")
                     
             except Exception as e:
-                err_msg = str(e)
-                self.root.after(0, lambda: messagebox.showerror("云端同步失败", err_msg))
+                err_msg = str(e)  # 先转成普通字符串
+                self.root.after(0, lambda msg=err_msg: messagebox.showerror("云端同步失败", msg))
             finally:
                 self.root.after(0, lambda: self.status_var.set("状态: 云端操作结束"))
                 self.root.after(0, lambda: self.upload_btn.configure(state="normal"))
@@ -369,7 +377,7 @@ class StreamRecorderApp:
 
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
-            messagebox.showerror("环境缺失", "找不到 ffmpeg.exe！")
+            messagebox.showerror("环境缺失", "找不到 ffmpeg，请确保系统已安装。")
             return
 
         if not self.preview_running:
@@ -400,7 +408,7 @@ class StreamRecorderApp:
         command.extend(['-i', url])
         command.extend([
             '-c:v', 'copy',       
-            '-c:a', 'aac',        # 强制转为 aac 格式防崩溃
+            '-c:a', 'aac',        
             '-f', 'segment',
             '-segment_atclocktime', '1',  
             '-segment_time', '86400',     
@@ -413,6 +421,7 @@ class StreamRecorderApp:
             with open(log_file_path, "w", encoding="utf-8") as log_file:
                 log_file.write(f"=== 24H 录像日志 ===\n执行命令: {' '.join(command)}\n\n")
                 log_file.flush()
+                # 跨平台隐藏窗口处理
                 kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
                 self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_file, stderr=subprocess.STDOUT, **kwargs)
 

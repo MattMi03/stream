@@ -1,0 +1,5 @@
+venv/
+ffmpeg.exe
+*.mp4
+*.log
+.DS_Store
