@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXEs
 
 on:
   push:
@@ -24,13 +24,18 @@ jobs:
         pip install pyinstaller
         pip install customtkinter opencv-python pillow flask requests
 
-    - name: 使用 PyInstaller 打包
+    - name: 打包工具 1 - HTTP 直播流转发器
       run: |
-        # --collect-all customtkinter 保证 UI 主题和字体完美打包
-        pyinstaller -w -F --add-data "ffmpeg.exe;." --collect-all customtkinter app.py
+        # 这个工具不需要 ffmpeg，纯净打包
+        pyinstaller -w -F --collect-all customtkinter -n HttpStreamer app_http_stream.py
 
-    - name: 上传生成的 EXE 文件
+    - name: 打包工具 2 - 底层录制与云端同步工具
+      run: |
+        # 这个工具依赖 ffmpeg.exe 进行 24H 存盘和音频强转
+        pyinstaller -w -F --add-data "ffmpeg.exe;." --collect-all customtkinter -n CloudRecorder app_record_cloud.py
+
+    - name: 上传生成的 EXE 文件包
       uses: actions/upload-artifact@v4
       with:
-        name: StreamRecorder-Cloud-EXE
-        path: dist/app.exe
+        name: VideoCheck-Tools-Windows
+        path: dist/*.exe
