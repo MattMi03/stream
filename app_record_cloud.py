@@ -137,24 +137,67 @@ class RecorderAndCloudApp:
                 self.root.after(0, lambda msg=str(e): messagebox.showerror("网络错误", msg))
         threading.Thread(target=login_thread, daemon=True).start()
 
+    @staticmethod
+    def _parse_video_filename(filepath):
+        """
+        从文件名中解析录制开始时间。
+        文件名格式：录像_YYYY-MM-DD_HH-MM-SS.mp4
+        返回 (recordDate, startTime) 或 (None, None)
+        """
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        parts = base.split('_')
+        if len(parts) == 2 and parts[0] == '录像':
+            dt = parts[1].split('_')
+            if len(dt) == 2:
+                date_part = dt[0]      # YYYY-MM-DD
+                time_part = dt[1]      # HH-MM-SS
+                start_time = time_part.replace('-', ':')  # 转为 HH:MM:SS
+                return date_part, start_time
+        return None, None
+
     def do_upload_and_bind(self):
         filepath = filedialog.askopenfilename(title="选择要上传的录像", filetypes=[("MP4", "*.mp4"), ("All", "*.*")])
-        if not filepath: return
+        if not filepath:
+            return
+
         device_id = self.device_id_entry.get().strip()
         base_url = self.api_url_entry.get().strip().rstrip("/")
-        
-        self.status_var.set("状态: 获取凭证中...")
+
+        # 尝试从文件名解析录制开始时间
+        record_date, start_time = self._parse_video_filename(filepath)
+        if record_date and start_time:
+            self.status_var.set(f"状态: 解析到开始时间 {record_date} {start_time}")
+        else:
+            # 无法解析则使用当前时间
+            now = datetime.datetime.now()
+            record_date = now.strftime("%Y-%m-%d")
+            start_time = "00:00:00"
+            self.status_var.set("状态: 未解析到文件名时间，使用当前日期和00:00:00")
+
+        # 固定结束时间为当天23:59:59（可根据业务调整）
+        end_time = "23:59:59"
+
         self.upload_btn.configure(state="disabled")
 
         def upload_task():
             try:
                 headers = {"Authorization": f"Bearer {self.cloud_token}", "Content-Type": "application/json"}
                 # 1. 获取凭证
-                token_payload = {"studentId": "temp", "fileName": os.path.basename(filepath), "contentType": "video/mp4", "fileSize": os.path.getsize(filepath)}
-                resp_token = requests.post(f"{base_url}/admin/apifile/photos/upload-token", json=token_payload, headers=headers, verify=False)
+                token_payload = {
+                    "studentId": "temp",
+                    "fileName": os.path.basename(filepath),
+                    "contentType": "video/mp4",
+                    "fileSize": os.path.getsize(filepath)
+                }
+                resp_token = requests.post(
+                    f"{base_url}/admin/apifile/photos/upload-token",
+                    json=token_payload,
+                    headers=headers,
+                    verify=False
+                )
                 if resp_token.status_code != 200 or resp_token.json().get("code") != 200:
                     raise Exception(f"凭证失败: {resp_token.text}")
-                    
+
                 obj_key = resp_token.json()["data"]["objectKey"]
                 upl_url = resp_token.json()["data"]["uploadUrl"]
 
@@ -162,19 +205,27 @@ class RecorderAndCloudApp:
                 self.root.after(0, lambda: self.status_var.set("状态: 正在大文件直传 OSS..."))
                 with open(filepath, 'rb') as f:
                     resp_oss = requests.put(upl_url, headers={"Content-Type": "video/mp4"}, data=f, verify=False)
-                    if resp_oss.status_code not in (200, 201): raise Exception("OSS直传失败")
+                    if resp_oss.status_code not in (200, 201):
+                        raise Exception("OSS直传失败")
 
-                # 3. 入库绑定
+                # 3. 入库绑定（使用解析出的开始时间）
                 self.root.after(0, lambda: self.status_var.set("状态: 正在绑定录像记录..."))
                 save_payload = {
-                    "deviceId": int(device_id), "videoUrl": obj_key, 
-                    "recordDate": datetime.datetime.now().strftime("%Y-%m-%d"), 
-                    "startTime": "00:00:00", "endTime": "23:59:59"
+                    "deviceId": int(device_id),
+                    "videoUrl": obj_key,
+                    "recordDate": record_date,
+                    "startTime": start_time,
+                    "endTime": end_time
                 }
-                resp_save = requests.post(f"{base_url}/admin/apistudentaffair/admin/videocheck/domain/playback/save", json=save_payload, headers=headers, verify=False)
-                
+                resp_save = requests.post(
+                    f"{base_url}/admin/apistudentaffair/admin/videocheck/domain/playback/save",
+                    json=save_payload,
+                    headers=headers,
+                    verify=False
+                )
+
                 if resp_save.status_code == 200 and resp_save.json().get("code") == 200:
-                    self.root.after(0, lambda: messagebox.showinfo("完成", f"上传并入库成功！\n云标识: {obj_key}"))
+                    self.root.after(0, lambda: messagebox.showinfo("完成", f"上传并入库成功！\n云标识: {obj_key}\n开始时间: {record_date} {start_time}"))
                 else:
                     raise Exception(f"入库失败: {resp_save.text}")
             except Exception as e:
@@ -182,6 +233,7 @@ class RecorderAndCloudApp:
             finally:
                 self.root.after(0, lambda: self.status_var.set("状态: 同步结束"))
                 self.root.after(0, lambda: self.upload_btn.configure(state="normal"))
+
         threading.Thread(target=upload_task, daemon=True).start()
 
     # -------- 录制逻辑 --------
