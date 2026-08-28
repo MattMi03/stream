@@ -13,12 +13,36 @@ import requests
 import urllib3
 import datetime
 import re
+import logging
 
 warnings.filterwarnings("ignore", category=UserWarning, module="customtkinter")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
+
+# 解析/上传调试日志：写到录像保存目录下的 videocheck_debug.log，用户直接发回该文件即可排查
+logger = logging.getLogger("videocheck")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+def setup_logger(log_dir, fallback_dir=None):
+    """把日志定向到指定目录；目录不可用则依次回退到所选文件目录、用户主目录"""
+    if log_dir and os.path.isdir(log_dir):
+        target_dir = log_dir
+    elif fallback_dir and os.path.isdir(fallback_dir):
+        target_dir = fallback_dir
+    else:
+        target_dir = os.path.expanduser("~")
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+        h.close()
+    log_path = os.path.join(target_dir, "videocheck_debug.log")
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+    return log_path
 
 
 def get_ffmpeg_path():
@@ -172,13 +196,16 @@ class RecorderAndCloudApp:
         返回 (recordDate, startTime) 或 (None, None)
         """
         base = os.path.splitext(os.path.basename(filepath))[0]
+        logger.info(f"开始解析文件名: {base!r}")
         # 匹配任意前缀 + _YYYY-MM-DD_HH-MM-SS 结尾
         pattern = r'.*_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$'
         match = re.match(pattern, base)
         if match:
             date_part = match.group(1)          # 2026-08-25
             time_part = match.group(2).replace('-', ':')  # 22-06-36 -> 22:06:36
+            logger.info(f"文件名解析成功: recordDate={date_part}, startTime={time_part}")
             return date_part, time_part
+        logger.info(f"文件名解析失败（未匹配到 _YYYY-MM-DD_HH-MM-SS 结尾格式）: {base!r}")
         return None, None
 
     @staticmethod
@@ -202,6 +229,11 @@ class RecorderAndCloudApp:
         filepath = filedialog.askopenfilename(title="选择要上传的录像", filetypes=[("MP4", "*.mp4"), ("All", "*.*")])
         if not filepath:
             return
+        log_path = setup_logger(self.dir_entry.get().strip(), os.path.dirname(filepath))
+        logger.info("=" * 50)
+        logger.info(f"开始一次上传 | 操作系统: {'Windows' if os.name == 'nt' else 'macOS/Linux'}")
+        logger.info(f"本次日志文件: {log_path}")
+        logger.info(f"选择的文件: {filepath}")
 
         device_id = self.device_id_entry.get().strip()
         base_url = self.api_url_entry.get().strip().rstrip("/")
@@ -209,6 +241,7 @@ class RecorderAndCloudApp:
         # 解析开始时间
         record_date, start_time = self._parse_video_filename(filepath)
         if not record_date or not start_time:
+            logger.info("回退：使用当前日期 + 00:00:00 作为开始时间")
             now = datetime.datetime.now()
             record_date = now.strftime("%Y-%m-%d")
             start_time = "00:00:00"
@@ -218,6 +251,7 @@ class RecorderAndCloudApp:
 
         # 获取视频时长（秒）
         duration = get_video_duration(filepath)
+        logger.info(f"视频时长: {duration:.1f} 秒")
         if duration <= 0:
             end_time = "23:59:59"
             self.status_var.set("状态: 无法读取视频时长，结束时间设为 23:59:59")
@@ -265,6 +299,7 @@ class RecorderAndCloudApp:
                     "startTime": start_time,
                     "endTime": end_time
                 }
+                logger.info(f"入库参数: {save_payload}")
                 resp_save = requests.post(
                     f"{base_url}/admin/apistudentaffair/admin/videocheck/domain/playback/save",
                     json=save_payload,
@@ -277,6 +312,7 @@ class RecorderAndCloudApp:
                 else:
                     raise Exception(f"入库失败: {resp_save.text}")
             except Exception as e:
+                logger.exception(f"上传/入库失败: {e}")
                 self.root.after(0, lambda msg=str(e): messagebox.showerror("错误", msg))
             finally:
                 self.root.after(0, lambda: self.status_var.set("状态: 同步结束"))
