@@ -48,7 +48,7 @@ class RecorderAndCloudApp:
     def __init__(self, root):
         self.root = root
         self.root.title("监控录制与云端同步工具 - 业务专版")
-        self.root.geometry("540x740")
+        self.root.geometry("540x780")
         self.root.resizable(False, False)
 
         self.process = None
@@ -58,6 +58,7 @@ class RecorderAndCloudApp:
         self.preview_running = False
         self.cap = None
         self.cloud_token = ""
+        self.heartbeat_running = False
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -103,6 +104,10 @@ class RecorderAndCloudApp:
         self.device_id_entry = ctk.CTkEntry(cloud_frame, width=100)
         self.device_id_entry.grid(row=2, column=3, sticky="w")
         self.device_id_entry.insert(0, "1")
+
+        ctk.CTkLabel(cloud_frame, text="设备Code:").grid(row=4, column=0, sticky="e", padx=5, pady=5)
+        self.device_code_entry = ctk.CTkEntry(cloud_frame, width=140)
+        self.device_code_entry.grid(row=4, column=1, columnspan=3, sticky="w")
 
         self.login_btn = ctk.CTkButton(cloud_frame, text="🔑 登录取Token", width=120, command=self.do_login)
         self.login_btn.grid(row=3, column=0, columnspan=2, pady=10, padx=10)
@@ -278,6 +283,36 @@ class RecorderAndCloudApp:
 
         threading.Thread(target=upload_task, daemon=True).start()
 
+    # -------- 录制心跳上报 --------
+    def _send_heartbeat(self, is_recording=1):
+        """上报录制心跳到云端公共接口（无需登录态），按设备Code定位设备"""
+        base_url = self.api_url_entry.get().strip().rstrip("/")
+        device_code = self.device_code_entry.get().strip()
+        if not base_url or not device_code:
+            return
+        try:
+            resp = requests.post(
+                f"{base_url}/admin/apistudentaffair/public/videocheck/record/heartbeat",
+                params={"deviceCode": device_code, "isRecording": is_recording},
+                verify=False, timeout=5
+            )
+            if resp.status_code != 200 or resp.json().get("code") != 200:
+                print(f"心跳上报异常: {resp.text}")
+        except Exception as e:
+            print(f"心跳上报失败: {e}")
+
+    def _heartbeat_loop(self):
+        """录制期间每60秒上报一次心跳（管理端超过10分钟未收到则视为未录制）"""
+        self._send_heartbeat(1)
+        waited = 0
+        while self.heartbeat_running:
+            time.sleep(1)
+            waited += 1
+            if waited >= 60:
+                waited = 0
+                if self.heartbeat_running:
+                    self._send_heartbeat(1)
+
     # -------- 录制逻辑 --------
     def browse_dir(self):
         dirname = filedialog.askdirectory()
@@ -362,9 +397,15 @@ class RecorderAndCloudApp:
             except subprocess.TimeoutExpired:
                 self.start_time = time.time()
                 self.update_timer()
+                # 录制启动成功：开始向云端上报录制心跳
+                self.heartbeat_running = True
+                threading.Thread(target=self._heartbeat_loop, daemon=True).start()
             self.process.wait()
         except Exception as e:
             print(e)
+        # 录制结束：停止心跳并上报未录制状态
+        self.heartbeat_running = False
+        self._send_heartbeat(0)
         self.is_recording = False
         self.root.after(0, self._reset_ui)
 
