@@ -8,6 +8,7 @@ from flask import Flask, Response
 import logging
 import warnings
 import os
+import json
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
@@ -18,12 +19,14 @@ log.setLevel(logging.ERROR)
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
+CONFIG_FILE = "camera_config.json"
+
 
 class MultiHttpStreamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("多路摄像头 HTTP 直播流转发服务（稳定版）")
-        self.root.geometry("640x700")
+        self.root.title("多路摄像头 HTTP 直播流转发服务（配置持久化）")
+        self.root.geometry("640x750")
         self.root.resizable(True, True)
 
         self.cameras = []
@@ -55,7 +58,10 @@ class MultiHttpStreamerApp:
         self.stop_btn.pack(side="left", padx=5)
 
         self.add_btn = ctk.CTkButton(control_frame, text="➕ 添加摄像头", width=120, command=self.add_camera)
-        self.add_btn.pack(side="right", padx=5)
+        self.add_btn.pack(side="left", padx=5)
+
+        self.save_btn = ctk.CTkButton(control_frame, text="💾 保存配置", width=100, command=self.save_config, fg_color="#2e7d32", hover_color="#1b5e20")
+        self.save_btn.pack(side="right", padx=5)
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="摄像头列表")
         self.scrollable_frame.pack(fill="both", expand=True, pady=10)
@@ -64,8 +70,8 @@ class MultiHttpStreamerApp:
         self.status_label = ctk.CTkLabel(self.main_frame, textvariable=self.status_var, font=ctk.CTkFont(size=11))
         self.status_label.pack(anchor="w", pady=(5, 0))
 
-        # 默认添加一个摄像头
-        self.add_camera()
+        # 加载配置文件
+        self.load_config()
 
     # ---------- Flask 路由 ----------
     def setup_flask_routes(self):
@@ -85,8 +91,56 @@ class MultiHttpStreamerApp:
                         time.sleep(0.1)
             return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    # ---------- 添加/删除摄像头 ----------
-    def add_camera(self):
+    # ---------- 配置持久化 ----------
+    def save_config(self):
+        """保存当前摄像头地址列表和端口到 JSON 文件"""
+        config = {
+            "port": self.port_entry.get().strip(),
+            "cameras": [cam['url_entry'].get().strip() for cam in self.cameras if cam['url_entry'].get().strip()]
+        }
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=2)
+            self.status_var.set("状态: 配置已保存")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+
+    def load_config(self):
+        """加载配置文件，恢复摄像头列表和端口"""
+        if not os.path.exists(CONFIG_FILE):
+            # 默认添加一个示例摄像头
+            self.add_camera()
+            return
+
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+            # 恢复端口
+            if 'port' in config and config['port'].isdigit():
+                self.port_entry.delete(0, ctk.END)
+                self.port_entry.insert(0, config['port'])
+
+            # 恢复摄像头列表
+            urls = config.get('cameras', [])
+            if urls:
+                # 先移除默认添加的摄像头（如果有）
+                for cam in self.cameras[:]:
+                    if cam['card']:  # 销毁卡片
+                        cam['card'].destroy()
+                    self.cameras.remove(cam)
+                self.camera_counter = 0
+                for url in urls:
+                    self.add_camera_with_url(url)
+            else:
+                # 如果没有摄像头，添加一个默认示例
+                self.add_camera()
+            self.status_var.set("状态: 配置已加载")
+        except Exception as e:
+            messagebox.showerror("加载配置失败", str(e))
+            self.add_camera()  # 出错则添加默认示例
+
+    def add_camera_with_url(self, url):
+        """内部方法：直接添加带指定 URL 的摄像头（不保存配置）"""
         cam_id = self.camera_counter
         self.camera_counter += 1
 
@@ -95,7 +149,7 @@ class MultiHttpStreamerApp:
 
         url_entry = ctk.CTkEntry(card, placeholder_text="输入 RTSP 地址")
         url_entry.pack(fill="x", padx=10, pady=(5, 0))
-        url_entry.insert(0, f"rtsp://admin:password@192.168.1.100:554/stream{cam_id+1}")
+        url_entry.insert(0, url)
 
         preview_frame = ctk.CTkFrame(card, fg_color="transparent")
         preview_frame.pack(fill="x", padx=10, pady=5)
@@ -128,9 +182,16 @@ class MultiHttpStreamerApp:
         }
         self.cameras.append(cam_data)
 
+        # 如果服务已运行，自动启动此路
         if self.is_running:
             self._start_single_camera(cam_data)
             self.update_camera_url_display(cam_data)
+
+    # ---------- 添加/删除摄像头 ----------
+    def add_camera(self):
+        """添加摄像头（UI 操作），并自动保存配置"""
+        self.add_camera_with_url("rtsp://admin:password@192.168.1.100:554/stream")
+        self.save_config()  # 保存配置
 
     def remove_camera(self, card, cam_id):
         for cam in self.cameras:
@@ -138,12 +199,13 @@ class MultiHttpStreamerApp:
                 cam['running'] = False
                 if cam['cap']:
                     cam['cap'].release()
-                cam['_img'] = None   # 释放图像引用
+                cam['_img'] = None
                 break
         self.cameras = [cam for cam in self.cameras if cam['camera_id'] != cam_id]
         card.destroy()
         if not self.cameras and self.is_running:
             self.stop_all()
+        self.save_config()  # 保存配置
 
     # ---------- 更新 URL 显示 ----------
     def update_camera_url_display(self, cam_data=None):
@@ -172,7 +234,6 @@ class MultiHttpStreamerApp:
             cam_data['running'] = False
             return
 
-        # 外层循环：负责重连
         while cam_data['running']:
             try:
                 cap = cv2.VideoCapture(url)
@@ -215,10 +276,8 @@ class MultiHttpStreamerApp:
                     img = Image.fromarray(frame_rgb)
                     img.thumbnail((200, 120), Image.Resampling.LANCZOS)
                     imgtk = ImageTk.PhotoImage(img)
-                    cam_data['_img'] = imgtk  # 存储到字典中，保证引用有效
-
+                    cam_data['_img'] = imgtk
                     label = cam_data['preview_label']
-                    # 关键修复：在回调中直接使用 cam_data['_img']，而不是传递 imgtk 局部变量
                     self.root.after(0, lambda lbl=label, cd=cam_data: lbl.configure(image=cd['_img'], text=""))
 
                     elapsed = time.time() - start
@@ -241,7 +300,6 @@ class MultiHttpStreamerApp:
                 time.sleep(2)
                 continue
 
-        # 清理
         if cam_data['cap']:
             cam_data['cap'].release()
             cam_data['cap'] = None
@@ -286,6 +344,7 @@ class MultiHttpStreamerApp:
         self.stop_btn.configure(state="normal")
         self.status_var.set(f"状态: 已启动，端口 {port}，共 {len(self.cameras)} 路流")
         self.update_camera_url_display()
+        self.save_config()  # 保存端口
 
     def _start_flask_server(self, port):
         try:
@@ -306,6 +365,7 @@ class MultiHttpStreamerApp:
 
     # ---------- 窗口关闭 ----------
     def on_closing(self):
+        self.save_config()  # 关闭前保存
         for cam in self.cameras:
             cam['running'] = False
             if cam['cap']:
