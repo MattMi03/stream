@@ -93,7 +93,7 @@ class RecorderAndCloudApp:
         ctk.CTkLabel(self.main_frame, text="摄像头流媒体地址", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0,2))
         self.url_entry = ctk.CTkEntry(self.main_frame, width=500)
         self.url_entry.pack(fill="x", pady=(0,5))
-        self.url_entry.insert(0, "rtsp://admin:password@192.168.1.100:554/stream")
+        self.url_entry.insert(0, "rtsp://admin:@hyzh0223@183.223.111.139:554/h264/ch1/main/av_stream")
 
         ctk.CTkLabel(self.main_frame, text="本地保存文件夹 (自动分段录像)", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0,2))
         path_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
