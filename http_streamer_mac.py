@@ -9,10 +9,8 @@ import logging
 import warnings
 import os
 
-# ====== 关键优化：强制 RTSP 使用 TCP 传输 ======
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
-# 屏蔽警告
 warnings.filterwarnings("ignore", category=UserWarning, module="customtkinter")
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -24,7 +22,7 @@ ctk.set_default_color_theme("blue")
 class MultiHttpStreamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("多路摄像头 HTTP 直播流转发服务")
+        self.root.title("多路摄像头 HTTP 直播流转发服务（稳定版）")
         self.root.geometry("640x700")
         self.root.resizable(True, True)
 
@@ -38,7 +36,7 @@ class MultiHttpStreamerApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # UI 布局（与之前相同，略）
+        # ---------- UI ----------
         self.main_frame = ctk.CTkFrame(root, fg_color="transparent")
         self.main_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
@@ -52,7 +50,8 @@ class MultiHttpStreamerApp:
 
         self.start_btn = ctk.CTkButton(control_frame, text="▶ 启动所有流", width=100, command=self.start_all)
         self.start_btn.pack(side="left", padx=5)
-        self.stop_btn = ctk.CTkButton(control_frame, text="⏹ 停止所有流", width=100, fg_color="#F44336", hover_color="#D32F2F", state="disabled", command=self.stop_all)
+        self.stop_btn = ctk.CTkButton(control_frame, text="⏹ 停止所有流", width=100, fg_color="#F44336",
+                                      hover_color="#D32F2F", state="disabled", command=self.stop_all)
         self.stop_btn.pack(side="left", padx=5)
 
         self.add_btn = ctk.CTkButton(control_frame, text="➕ 添加摄像头", width=120, command=self.add_camera)
@@ -65,6 +64,7 @@ class MultiHttpStreamerApp:
         self.status_label = ctk.CTkLabel(self.main_frame, textvariable=self.status_var, font=ctk.CTkFont(size=11))
         self.status_label.pack(anchor="w", pady=(5, 0))
 
+        # 默认添加一个摄像头
         self.add_camera()
 
     # ---------- Flask 路由 ----------
@@ -138,6 +138,7 @@ class MultiHttpStreamerApp:
                 cam['running'] = False
                 if cam['cap']:
                     cam['cap'].release()
+                cam['_img'] = None   # 释放图像引用
                 break
         self.cameras = [cam for cam in self.cameras if cam['camera_id'] != cam_id]
         card.destroy()
@@ -164,58 +165,95 @@ class MultiHttpStreamerApp:
                 cam['url_display'].insert(0, url)
                 cam['url_display'].configure(state="readonly")
 
-    # ---------- 预览线程（带优化） ----------
+    # ---------- 核心预览线程（带自动重连） ----------
     def _preview_loop(self, cam_data):
         url = cam_data['url_entry'].get().strip()
         if not url:
             cam_data['running'] = False
             return
 
-        try:
-            cap = cv2.VideoCapture(url)
-            if url.lower().startswith('rtsp://'):
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # 减少缓冲，降低延迟
-            cam_data['cap'] = cap
-            cam_data['running'] = True
+        # 外层循环：负责重连
+        while cam_data['running']:
+            try:
+                cap = cv2.VideoCapture(url)
+                if url.lower().startswith('rtsp://'):
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cam_data['cap'] = cap
 
-            # 降低帧率到 8 fps 以减轻解码压力
-            frame_interval = 1.0 / 8
-            while cam_data['running'] and cap.isOpened():
-                start = time.time()
-                ret, frame = cap.read()
-                if not ret:
-                    # 如果流断开，尝试等待后继续（可加入重连逻辑，此处简单休眠）
-                    time.sleep(1)
+                if not cap.isOpened():
+                    cap.release()
+                    cam_data['cap'] = None
+                    self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="连接失败，重试中..."))
+                    time.sleep(2)
                     continue
 
-                ret_encode, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                if ret_encode:
-                    cam_data['frame_bytes'] = buffer.tobytes()
+                self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="预览中..."))
 
-                # 更新预览
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(frame_rgb)
-                img.thumbnail((200, 120), Image.Resampling.LANCZOS)
-                imgtk = ImageTk.PhotoImage(img)
-                cam_data['_img'] = imgtk
-                label = cam_data['preview_label']
-                self.root.after(0, lambda lbl=label, img=imgtk: lbl.configure(image=img, text=""))
+                frame_interval = 1.0 / 8
+                fail_count = 0
+                max_fail = 5
 
-                elapsed = time.time() - start
-                if elapsed < frame_interval:
-                    time.sleep(frame_interval - elapsed)
-        except Exception as e:
-            print(f"摄像头 {cam_data['camera_id']} 预览异常: {e}")
-        finally:
-            if cam_data['cap']:
-                cam_data['cap'].release()
-                cam_data['cap'] = None
-            cam_data['running'] = False
-            self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="已停止"))
+                while cam_data['running'] and cap.isOpened():
+                    start = time.time()
+                    ret, frame = cap.read()
+                    if not ret:
+                        fail_count += 1
+                        if fail_count >= max_fail:
+                            print(f"摄像头 {cam_data['camera_id']} 读取失败，触发重连")
+                            break
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        fail_count = 0
 
-    # ---------- 启动/停止等（与之前相同）----------
+                    ret_encode, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                    if ret_encode:
+                        cam_data['frame_bytes'] = buffer.tobytes()
+
+                    # 更新预览
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(frame_rgb)
+                    img.thumbnail((200, 120), Image.Resampling.LANCZOS)
+                    imgtk = ImageTk.PhotoImage(img)
+                    cam_data['_img'] = imgtk  # 存储到字典中，保证引用有效
+
+                    label = cam_data['preview_label']
+                    # 关键修复：在回调中直接使用 cam_data['_img']，而不是传递 imgtk 局部变量
+                    self.root.after(0, lambda lbl=label, cd=cam_data: lbl.configure(image=cd['_img'], text=""))
+
+                    elapsed = time.time() - start
+                    if elapsed < frame_interval:
+                        time.sleep(frame_interval - elapsed)
+
+                if cam_data['running']:
+                    print(f"摄像头 {cam_data['camera_id']} 断开，正在重连...")
+                    self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="重连中..."))
+                    if cap:
+                        cap.release()
+                        cam_data['cap'] = None
+                    time.sleep(1)
+                    continue
+                else:
+                    break
+
+            except Exception as e:
+                print(f"摄像头 {cam_data['camera_id']} 异常: {e}")
+                time.sleep(2)
+                continue
+
+        # 清理
+        if cam_data['cap']:
+            cam_data['cap'].release()
+            cam_data['cap'] = None
+        cam_data['running'] = False
+        cam_data['frame_bytes'] = None
+        cam_data['_img'] = None
+        self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="已停止"))
+
+    # ---------- 启动/停止单个摄像头 ----------
     def _start_single_camera(self, cam_data):
         if not cam_data['running']:
+            cam_data['running'] = True
             thread = threading.Thread(target=self._preview_loop, args=(cam_data,), daemon=True)
             cam_data['thread'] = thread
             thread.start()
@@ -225,7 +263,9 @@ class MultiHttpStreamerApp:
         if cam_data['cap']:
             cam_data['cap'].release()
             cam_data['cap'] = None
+        cam_data['_img'] = None
 
+    # ---------- 启动所有流 ----------
     def start_all(self):
         port = self.port_entry.get().strip()
         if not port.isdigit():
@@ -253,6 +293,7 @@ class MultiHttpStreamerApp:
         except Exception as e:
             print(f"Flask 异常: {e}")
 
+    # ---------- 停止所有流 ----------
     def stop_all(self):
         for cam in self.cameras:
             self._stop_single_camera(cam)
@@ -263,6 +304,7 @@ class MultiHttpStreamerApp:
         for cam in self.cameras:
             cam['preview_label'].configure(image=None, text="已停止")
 
+    # ---------- 窗口关闭 ----------
     def on_closing(self):
         for cam in self.cameras:
             cam['running'] = False
