@@ -9,6 +9,18 @@ import logging
 import warnings
 import os
 import json
+import subprocess
+import sys
+
+# ========== HTTPS 证书生成相关 ==========
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
@@ -25,8 +37,8 @@ CONFIG_FILE = "camera_config.json"
 class MultiHttpStreamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("多路摄像头 HTTP 直播流转发服务（配置持久化）")
-        self.root.geometry("640x750")
+        self.root.title("多路摄像头 HTTP/HTTPS 直播流转发服务")
+        self.root.geometry("640x780")
         self.root.resizable(True, True)
 
         self.cameras = []
@@ -46,10 +58,16 @@ class MultiHttpStreamerApp:
         control_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         control_frame.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(control_frame, text="HTTP 端口:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0,5))
+        ctk.CTkLabel(control_frame, text="端口:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0,5))
         self.port_entry = ctk.CTkEntry(control_frame, width=80)
         self.port_entry.pack(side="left", padx=(0, 15))
         self.port_entry.insert(0, "8080")
+
+        # HTTPS 开关
+        self.use_https_var = ctk.BooleanVar(value=True)  # 默认启用 HTTPS
+        self.https_check = ctk.CTkCheckBox(control_frame, text="启用 HTTPS (自签名证书)", variable=self.use_https_var,
+                                           command=self.on_https_toggle)
+        self.https_check.pack(side="left", padx=5)
 
         self.start_btn = ctk.CTkButton(control_frame, text="▶ 启动所有流", width=100, command=self.start_all)
         self.start_btn.pack(side="left", padx=5)
@@ -60,7 +78,8 @@ class MultiHttpStreamerApp:
         self.add_btn = ctk.CTkButton(control_frame, text="➕ 添加摄像头", width=120, command=self.add_camera)
         self.add_btn.pack(side="left", padx=5)
 
-        self.save_btn = ctk.CTkButton(control_frame, text="💾 保存配置", width=100, command=self.save_config, fg_color="#2e7d32", hover_color="#1b5e20")
+        self.save_btn = ctk.CTkButton(control_frame, text="💾 保存配置", width=100, command=self.save_config,
+                                      fg_color="#2e7d32", hover_color="#1b5e20")
         self.save_btn.pack(side="right", padx=5)
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="摄像头列表")
@@ -70,8 +89,23 @@ class MultiHttpStreamerApp:
         self.status_label = ctk.CTkLabel(self.main_frame, textvariable=self.status_var, font=ctk.CTkFont(size=11))
         self.status_label.pack(anchor="w", pady=(5, 0))
 
+        # 提示标签（显示证书信任指导）
+        self.hint_var = ctk.StringVar(value="提示：启用 HTTPS 时，首次访问若浏览器显示警告，请点击“高级”->“继续访问”")
+        self.hint_label = ctk.CTkLabel(self.main_frame, textvariable=self.hint_var, font=ctk.CTkFont(size=10),
+                                       text_color="orange")
+        self.hint_label.pack(anchor="w", pady=(5, 0))
+
         # 加载配置文件
         self.load_config()
+
+    # ---------- HTTPS 切换 ----------
+    def on_https_toggle(self):
+        """当 HTTPS 复选框切换时，更新提示"""
+        if self.use_https_var.get():
+            self.hint_var.set("提示：启用 HTTPS 时，首次访问若浏览器显示警告，请点击“高级”->“继续访问”")
+        else:
+            self.hint_var.set("使用 HTTP（不加密，适合局域网/本机）")
+        self.update_camera_url_display()  # 刷新 URL 显示
 
     # ---------- Flask 路由 ----------
     def setup_flask_routes(self):
@@ -91,11 +125,76 @@ class MultiHttpStreamerApp:
                         time.sleep(0.1)
             return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+    # ---------- 证书生成函数 ----------
+    def generate_self_signed_cert(self, cert_path="cert.pem", key_path="key.pem"):
+        """生成自签名证书，如果已存在则直接返回"""
+        if os.path.exists(cert_path) and os.path.exists(key_path):
+            return cert_path, key_path
+
+        # 如果 cryptography 可用，用纯 Python 生成
+        if CRYPTO_AVAILABLE:
+            try:
+                private_key = rsa.generate_private_key(
+                    public_exponent=65537,
+                    key_size=2048,
+                )
+                subject = issuer = x509.Name([
+                    x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+                    x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Shanghai"),
+                    x509.NameAttribute(NameOID.LOCALITY_NAME, "Shanghai"),
+                    x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Self-Signed"),
+                    x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+                ])
+                cert = x509.CertificateBuilder().subject_name(
+                    subject
+                ).issuer_name(
+                    issuer
+                ).public_key(
+                    private_key.public_key()
+                ).serial_number(
+                    x509.random_serial_number()
+                ).not_valid_before(
+                    datetime.datetime.utcnow()
+                ).not_valid_after(
+                    datetime.datetime.utcnow() + datetime.timedelta(days=365)
+                ).add_extension(
+                    x509.SubjectAlternativeName([
+                        x509.DNSName("localhost"),
+                        x509.DNSName("127.0.0.1"),
+                    ]),
+                    critical=False,
+                ).sign(private_key, hashes.SHA256())
+
+                with open(key_path, "wb") as f:
+                    f.write(private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption()
+                    ))
+                with open(cert_path, "wb") as f:
+                    f.write(cert.public_bytes(serialization.Encoding.PEM))
+                return cert_path, key_path
+            except Exception as e:
+                print(f"使用 cryptography 生成证书失败，尝试 openssl: {e}")
+
+        # 回退到系统 openssl 命令（如果可用）
+        try:
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-nodes", "-out", cert_path, "-keyout", key_path,
+                "-days", "365",
+                "-subj", "/CN=localhost"
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return cert_path, key_path
+        except Exception:
+            # 如果都失败，则返回 None，后续用 HTTP 模式
+            return None, None
+
     # ---------- 配置持久化 ----------
     def save_config(self):
-        """保存当前摄像头地址列表和端口到 JSON 文件"""
         config = {
             "port": self.port_entry.get().strip(),
+            "use_https": self.use_https_var.get(),
             "cameras": [cam['url_entry'].get().strip() for cam in self.cameras if cam['url_entry'].get().strip()]
         }
         try:
@@ -106,41 +205,35 @@ class MultiHttpStreamerApp:
             messagebox.showerror("保存失败", str(e))
 
     def load_config(self):
-        """加载配置文件，恢复摄像头列表和端口"""
         if not os.path.exists(CONFIG_FILE):
-            # 默认添加一个示例摄像头
             self.add_camera()
             return
-
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
-            # 恢复端口
             if 'port' in config and config['port'].isdigit():
                 self.port_entry.delete(0, ctk.END)
                 self.port_entry.insert(0, config['port'])
-
-            # 恢复摄像头列表
+            if 'use_https' in config:
+                self.use_https_var.set(config['use_https'])
+                self.on_https_toggle()
             urls = config.get('cameras', [])
             if urls:
-                # 先移除默认添加的摄像头（如果有）
                 for cam in self.cameras[:]:
-                    if cam['card']:  # 销毁卡片
+                    if cam['card']:
                         cam['card'].destroy()
                     self.cameras.remove(cam)
                 self.camera_counter = 0
                 for url in urls:
                     self.add_camera_with_url(url)
             else:
-                # 如果没有摄像头，添加一个默认示例
                 self.add_camera()
             self.status_var.set("状态: 配置已加载")
         except Exception as e:
             messagebox.showerror("加载配置失败", str(e))
-            self.add_camera()  # 出错则添加默认示例
+            self.add_camera()
 
     def add_camera_with_url(self, url):
-        """内部方法：直接添加带指定 URL 的摄像头（不保存配置）"""
         cam_id = self.camera_counter
         self.camera_counter += 1
 
@@ -182,16 +275,13 @@ class MultiHttpStreamerApp:
         }
         self.cameras.append(cam_data)
 
-        # 如果服务已运行，自动启动此路
         if self.is_running:
             self._start_single_camera(cam_data)
             self.update_camera_url_display(cam_data)
 
-    # ---------- 添加/删除摄像头 ----------
     def add_camera(self):
-        """添加摄像头（UI 操作），并自动保存配置"""
         self.add_camera_with_url("rtsp://admin:password@192.168.1.100:554/stream")
-        self.save_config()  # 保存配置
+        self.save_config()
 
     def remove_camera(self, card, cam_id):
         for cam in self.cameras:
@@ -205,14 +295,15 @@ class MultiHttpStreamerApp:
         card.destroy()
         if not self.cameras and self.is_running:
             self.stop_all()
-        self.save_config()  # 保存配置
+        self.save_config()
 
     # ---------- 更新 URL 显示 ----------
     def update_camera_url_display(self, cam_data=None):
         port = self.port_entry.get().strip()
         if not port.isdigit():
             return
-        base_url = f"http://localhost:{port}/stream/"
+        protocol = "https" if self.use_https_var.get() else "http"
+        base_url = f"{protocol}://localhost:{port}/stream/"
         if cam_data:
             url = base_url + str(cam_data['camera_id'])
             cam_data['url_display'].configure(state="normal")
@@ -227,7 +318,7 @@ class MultiHttpStreamerApp:
                 cam['url_display'].insert(0, url)
                 cam['url_display'].configure(state="readonly")
 
-    # ---------- 核心预览线程（带自动重连） ----------
+    # ---------- 核心预览线程 ----------
     def _preview_loop(self, cam_data):
         url = cam_data['url_entry'].get().strip()
         if not url:
@@ -271,7 +362,6 @@ class MultiHttpStreamerApp:
                     if ret_encode:
                         cam_data['frame_bytes'] = buffer.tobytes()
 
-                    # 更新预览
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     img = Image.fromarray(frame_rgb)
                     img.thumbnail((200, 120), Image.Resampling.LANCZOS)
@@ -308,7 +398,6 @@ class MultiHttpStreamerApp:
         cam_data['_img'] = None
         self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="已停止"))
 
-    # ---------- 启动/停止单个摄像头 ----------
     def _start_single_camera(self, cam_data):
         if not cam_data['running']:
             cam_data['running'] = True
@@ -331,28 +420,44 @@ class MultiHttpStreamerApp:
             return
         port = int(port)
 
+        # 如果启用 HTTPS，生成证书
+        ssl_context = None
+        if self.use_https_var.get():
+            cert_path, key_path = self.generate_self_signed_cert()
+            if cert_path and key_path:
+                ssl_context = (cert_path, key_path)
+            else:
+                # 生成失败，自动降级到 HTTP 并提醒
+                self.use_https_var.set(False)
+                self.on_https_toggle()
+                messagebox.showwarning("证书生成失败", "无法生成自签名证书，将使用 HTTP 模式")
+                self.update_camera_url_display()
+
         for cam in self.cameras:
             self._start_single_camera(cam)
 
         if self.flask_thread is None or not self.flask_thread.is_alive():
-            self.flask_thread = threading.Thread(target=self._start_flask_server, args=(port,), daemon=True)
+            self.flask_thread = threading.Thread(target=self._start_flask_server,
+                                                 args=(port, ssl_context), daemon=True)
             self.flask_thread.start()
             time.sleep(0.5)
 
         self.is_running = True
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_var.set(f"状态: 已启动，端口 {port}，共 {len(self.cameras)} 路流")
+        protocol = "HTTPS" if self.use_https_var.get() else "HTTP"
+        self.status_var.set(f"状态: 已启动 {protocol}，端口 {port}，共 {len(self.cameras)} 路流")
         self.update_camera_url_display()
-        self.save_config()  # 保存端口
+        self.save_config()
 
-    def _start_flask_server(self, port):
+    def _start_flask_server(self, port, ssl_context):
         try:
-            self.flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+            self.flask_app.run(host='0.0.0.0', port=port, debug=False,
+                               use_reloader=False, ssl_context=ssl_context)
         except Exception as e:
             print(f"Flask 异常: {e}")
 
-    # ---------- 停止所有流 ----------
+    # ---------- 停止 ----------
     def stop_all(self):
         for cam in self.cameras:
             self._stop_single_camera(cam)
@@ -363,9 +468,9 @@ class MultiHttpStreamerApp:
         for cam in self.cameras:
             cam['preview_label'].configure(image=None, text="已停止")
 
-    # ---------- 窗口关闭 ----------
+    # ---------- 关闭 ----------
     def on_closing(self):
-        self.save_config()  # 关闭前保存
+        self.save_config()
         for cam in self.cameras:
             cam['running'] = False
             if cam['cap']:
