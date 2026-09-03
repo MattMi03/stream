@@ -421,10 +421,16 @@ class MultiHttpStreamerApp:
         ]
 
         try:
+            # 在 Windows 系统下，设置隐藏 CMD 窗口参数
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
             cam_data['ffmpeg_proc'] = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=log_fp,
-                stderr=subprocess.STDOUT
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags  # <-- 关键：禁止弹出终端窗口
             )
             cam_data['ffmpeg_log_fp'] = log_fp
         except Exception as e:
