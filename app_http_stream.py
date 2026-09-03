@@ -5,7 +5,7 @@ import time
 import cv2
 from PIL import Image, ImageTk
 from flask import Flask, Response, send_from_directory, render_template_string
-from flask_cors import CORS  # 新增 CORS
+from flask_cors import CORS
 import logging
 import warnings
 import os
@@ -47,17 +47,20 @@ def get_cert_files():
 def get_ffmpeg_path():
     """获取打包或当前目录的 ffmpeg.exe 路径"""
     if os.path.exists("ffmpeg.exe"):
-        return "ffmpeg.exe"
+        return os.path.abspath("ffmpeg.exe")
     if hasattr(sys, '_MEIPASS'):
         bundled = os.path.join(sys._MEIPASS, "ffmpeg.exe")
         if os.path.exists(bundled):
             return bundled
-    return "ffmpeg"  # 依赖系统环境变量兜底
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    return None
 
 class MultiHttpStreamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("多路摄像头 音视频直播流服务 (HLS)")
+        self.root.title("多路摄像头 音视频直播流服务 (HLS + CORS)")
         self.root.geometry("680x780")
         self.root.resizable(True, True)
 
@@ -71,8 +74,7 @@ class MultiHttpStreamerApp:
         os.makedirs(HLS_TEMP_DIR, exist_ok=True)
 
         self.flask_app = Flask(__name__)
-        # 启用全站 CORS 跨域
-        CORS(self.flask_app) 
+        CORS(self.flask_app)  # 全局启用 CORS
         
         self.flask_thread = None
         self.setup_flask_routes()
@@ -109,69 +111,142 @@ class MultiHttpStreamerApp:
                                       fg_color="#2e7d32", hover_color="#1b5e20")
         self.save_btn.pack(side="right", padx=5)
 
-        self.scrollable_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="摄像头列表 (带声音输出)")
+        self.scrollable_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="摄像头列表 (支持声音 & H.264/H.265)")
         self.scrollable_frame.pack(fill="both", expand=True, pady=10)
 
         self.status_var = ctk.StringVar(value="状态: 准备就绪")
         self.status_label = ctk.CTkLabel(self.main_frame, textvariable=self.status_var, font=ctk.CTkFont(size=11))
         self.status_label.pack(anchor="w", pady=(5, 0))
 
-        self.hint_var = ctk.StringVar(value="提示：启用 HTTPS 时首次访问若有警告，请点击“高级”->“继续访问”")
+        self.hint_var = ctk.StringVar(value="提示：跨域已开启。启用 HTTPS 时若浏览器拦截，请先信任证书。")
         self.hint_label = ctk.CTkLabel(self.main_frame, textvariable=self.hint_var, font=ctk.CTkFont(size=10),
                                        text_color="orange")
         self.hint_label.pack(anchor="w", pady=(5, 0))
+
+        # 检查 ffmpeg 是否存在
+        if not get_ffmpeg_path():
+            messagebox.showwarning("警告", "未在当前目录或系统中找到 ffmpeg.exe！音频转码和 HLS 将无法工作。")
 
         self.load_config()
 
     def on_https_toggle(self):
         self.update_camera_url_display()
 
-    # ---------- Flask 路由 (服务 HLS 和 播放器) ----------
+    # ---------- Flask 路由 (防 404 + 完美 CORS) ----------
     def setup_flask_routes(self):
+        @self.flask_app.after_request
+        def add_cors_headers(response):
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Headers'] = '*'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+            return response
+
         # 服务 M3U8 和 TS 切片文件
         @self.flask_app.route('/stream/<int:camera_id>/<path:filename>')
         def serve_hls(camera_id, filename):
-            cam_dir = os.path.join(HLS_TEMP_DIR, str(camera_id))
+            cam_dir = os.path.abspath(os.path.join(HLS_TEMP_DIR, str(camera_id)))
+            file_path = os.path.join(cam_dir, filename)
+
+            # 防 404：如果 index.m3u8 尚未生成，最多等待 5 秒直到 ffmpeg 写入首个文件
+            if filename == "index.m3u8" and not os.path.exists(file_path):
+                for _ in range(10):
+                    time.sleep(0.5)
+                    if os.path.exists(file_path):
+                        break
+
+            if not os.path.exists(file_path):
+                return Response(f"File {filename} not ready or camera error", status=404)
+
             response = send_from_directory(cam_dir, filename)
-            # 防止浏览器缓存 M3U8 文件
             if filename.endswith(".m3u8"):
+                response.headers['Content-Type'] = 'application/vnd.apple.mpegurl'
                 response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-                response.headers['Pragma'] = 'no-cache'
-                response.headers['Expires'] = '0'
+            elif filename.endswith(".ts"):
+                response.headers['Content-Type'] = 'video/mp2t'
             return response
 
-        # 提供一个内置的 Web 播放器页面，方便直接测试
+        # 优化后的 Web 播放器页面（解决浏览器自动播放拦截问题）
         @self.flask_app.route('/player/<int:camera_id>')
         def video_player(camera_id):
             html = """
             <!DOCTYPE html>
             <html>
             <head>
-                <title>Camera {{ camera_id }} 播放器</title>
+                <meta charset="utf-8">
+                <title>摄像头 {{ camera_id }} 实时直播</title>
                 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-                <style>body { background: #121212; color: white; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }</style>
+                <style>
+                    body { background: #121212; color: white; font-family: sans-serif; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+                    .video-container { position: relative; width: 85%; max-width: 1000px; background: #000; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+                    video { width: 100%; display: block; }
+                    .controls { margin-top: 15px; display: flex; gap: 10px; }
+                    button { background: #1976D2; color: white; border: none; padding: 10px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; }
+                    button:hover { background: #1565C0; }
+                    #status { margin-top: 10px; color: #aaa; font-size: 13px; }
+                </style>
             </head>
             <body>
-                <video id="video" controls autoplay muted style="width: 80%; max-width: 1200px; border: 2px solid #333;"></video>
+                <h2>摄像头 {{ camera_id }} 实时音视频直播</h2>
+                <div class="video-container">
+                    <video id="video" controls autoplay muted playsinline></video>
+                </div>
+                <div class="controls">
+                    <button id="unmuteBtn" onclick="enableAudio()">🔊 开启声音</button>
+                    <button onclick="reloadStream()">🔄 刷新视频</button>
+                </div>
+                <div id="status">正在初始化播放器...</div>
+
                 <script>
                   var video = document.getElementById('video');
+                  var statusDiv = document.getElementById('status');
                   var videoSrc = '/stream/{{ camera_id }}/index.m3u8';
-                  if (Hls.isSupported()) {
-                    var hls = new Hls();
-                    hls.loadSource(videoSrc);
-                    hls.attachMedia(video);
-                    hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play(); });
-                  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                    video.src = videoSrc;
-                    video.addEventListener('loadedmetadata', function() { video.play(); });
+                  var hls;
+
+                  function loadStream() {
+                    statusDiv.innerText = "正在连接视频流...";
+                    if (hls) { hls.destroy(); }
+
+                    if (Hls.isSupported()) {
+                      hls = new Hls({
+                        manifestLoadingMaxRetry: 10,
+                        manifestLoadingRetryDelay: 1000
+                      });
+                      hls.loadSource(videoSrc);
+                      hls.attachMedia(video);
+                      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                        statusDiv.innerText = "直播已就绪 (已静音起播，点击按钮开启声音)";
+                        video.play().catch(e => console.log(e));
+                      });
+                      hls.on(Hls.Events.ERROR, function(event, data) {
+                        if (data.fatal) {
+                          statusDiv.innerText = "连接等待中，正在重试...";
+                          setTimeout(() => loadStream(), 2000);
+                        }
+                      });
+                    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                      video.src = videoSrc;
+                      video.addEventListener('loadedmetadata', function() { video.play(); });
+                    }
                   }
+
+                  function enableAudio() {
+                    video.muted = false;
+                    video.play();
+                    document.getElementById('unmuteBtn').innerText = "🔊 声音已开启";
+                  }
+
+                  function reloadStream() {
+                    loadStream();
+                  }
+
+                  loadStream();
                 </script>
             </body>
             </html>
             """
             return render_template_string(html, camera_id=camera_id)
 
-    # ---------- 配置持久化 ----------
+    # ---------- 配置保存/加载 ----------
     def save_config(self):
         config = {
             "port": self.port_entry.get().strip(),
@@ -238,14 +313,13 @@ class MultiHttpStreamerApp:
                                 command=lambda c=card, id=cam_id: self.remove_camera(c, id))
         del_btn.pack(pady=2)
 
-        # 增加流地址和播放器地址的显示
         url_display = ctk.CTkEntry(card, width=400, state="readonly", font=ctk.CTkFont(size=10))
         url_display.pack(padx=10, pady=(0, 2), fill="x")
-        url_display.insert(0, "M3U8 直播地址 (用于前端调用)")
+        url_display.insert(0, "M3U8 直播地址 (用于前端跨域调用)")
 
         player_display = ctk.CTkEntry(card, width=400, state="readonly", font=ctk.CTkFont(size=10))
         player_display.pack(padx=10, pady=(0, 5), fill="x")
-        player_display.insert(0, "内置网页播放器地址 (复制到浏览器)")
+        player_display.insert(0, "内置网页播放器 (直接粘贴到浏览器)")
 
         cam_data = {
             'camera_id': cam_id,
@@ -257,7 +331,8 @@ class MultiHttpStreamerApp:
             'running': False,
             'cap': None,
             'thread': None,
-            'ffmpeg_proc': None, # 新增 ffmpeg 进程对象
+            'ffmpeg_proc': None,
+            'ffmpeg_log_fp': None,
             '_img': None,
         }
         self.cameras.append(cam_data)
@@ -303,34 +378,59 @@ class MultiHttpStreamerApp:
             cam['player_display'].insert(0, f"播放器: {player_url}")
             cam['player_display'].configure(state="readonly")
 
-    # ---------- FFmpeg HLS 后台转码 ----------
+    # ---------- FFmpeg 高兼容性转码核心 ----------
     def _start_ffmpeg_hls(self, cam_data):
         url = cam_data['url_entry'].get().strip()
-        cam_dir = os.path.join(HLS_TEMP_DIR, str(cam_data['camera_id']))
+        cam_dir = os.path.abspath(os.path.join(HLS_TEMP_DIR, str(cam_data['camera_id'])))
         os.makedirs(cam_dir, exist_ok=True)
         m3u8_path = os.path.join(cam_dir, "index.m3u8")
 
-        # FFmpeg 核心命令：视频原画拷贝 (节约CPU)，音频强制转 AAC (浏览器兼容)
+        ffmpeg_bin = get_ffmpeg_path()
+        if not ffmpeg_bin:
+            print(f"错误: 找不到 ffmpeg.exe")
+            return
+
+        log_file = os.path.join(cam_dir, "ffmpeg.log")
+        log_fp = open(log_file, "w", encoding="utf-8", errors="ignore")
+
+        # 参数详解：
+        # -map 0:v:0 -map 0:a:0? -> 允许无音频的摄像头正常运行
+        # -c:v libx264 -preset ultrafast -tune zerolatency -> 解决 H.265 一直转圈不播放问题
+        # -c:a aac -ac 2 -> 将音频强制转为 2声道 AAC，全平台完美支持
         ffmpeg_cmd = [
-            get_ffmpeg_path(),
+            ffmpeg_bin,
             "-y",
             "-rtsp_transport", "tcp",
+            "-probesize", "1000000",
+            "-analyzeduration", "1000000",
             "-i", url,
-            "-c:v", "copy",
-            "-c:a", "aac", 
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-ac", "2",
             "-b:a", "128k",
             "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "3",
-            "-hls_flags", "delete_segments",
+            "-hls_time", "1",
+            "-hls_list_size", "5",
+            "-hls_flags", "delete_segments+append_list+omit_endlist",
             m3u8_path
         ]
+
         try:
-            cam_data['ffmpeg_proc'] = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cam_data['ffmpeg_proc'] = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT
+            )
+            cam_data['ffmpeg_log_fp'] = log_fp
         except Exception as e:
             print(f"启动 FFmpeg 失败: {e}")
 
-    # ---------- 仅用于 UI 的轻量预览线程 ----------
+    # ---------- 仅用于 GUI 软件界面的轻量预览 ----------
     def _ui_preview_loop(self, cam_data):
         url = cam_data['url_entry'].get().strip()
         if not url: return
@@ -351,8 +451,7 @@ class MultiHttpStreamerApp:
 
                 self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text=""))
 
-                # 预览抽帧 (无需太快，1秒 5帧即可节省 UI 性能)
-                frame_interval = 1.0 / 5
+                frame_interval = 1.0 / 5  # 每秒 5 帧，降低 CPU 消耗
                 fail_count = 0
 
                 while cam_data['running'] and cap.isOpened():
@@ -391,15 +490,12 @@ class MultiHttpStreamerApp:
             cam_data['cap'] = None
         self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="已停止"))
 
-    # ---------- 启动/停止单路 ----------
+    # ---------- 启动/停止控制 ----------
     def _start_single_camera(self, cam_data):
         if not cam_data['running']:
             cam_data['running'] = True
-            
-            # 1. 启动 FFmpeg 转码服务给前端
             self._start_ffmpeg_hls(cam_data)
             
-            # 2. 启动 OpenCV 抽取给 UI 预览
             thread = threading.Thread(target=self._ui_preview_loop, args=(cam_data,), daemon=True)
             cam_data['thread'] = thread
             thread.start()
@@ -411,7 +507,6 @@ class MultiHttpStreamerApp:
             cam_data['cap'] = None
         cam_data['_img'] = None
         
-        # 杀死 ffmpeg 进程
         if cam_data.get('ffmpeg_proc'):
             try:
                 cam_data['ffmpeg_proc'].terminate()
@@ -420,7 +515,13 @@ class MultiHttpStreamerApp:
                 pass
             cam_data['ffmpeg_proc'] = None
 
-    # ---------- 全局启动/停止 ----------
+        if cam_data.get('ffmpeg_log_fp'):
+            try:
+                cam_data['ffmpeg_log_fp'].close()
+            except Exception:
+                pass
+            cam_data['ffmpeg_log_fp'] = None
+
     def start_all(self):
         port = self.port_entry.get().strip()
         if not port.isdigit():
@@ -473,7 +574,6 @@ class MultiHttpStreamerApp:
     def on_closing(self):
         self.save_config()
         self.stop_all()
-        # 清理临时切片
         if os.path.exists(HLS_TEMP_DIR):
             shutil.rmtree(HLS_TEMP_DIR, ignore_errors=True)
         self.root.destroy()
