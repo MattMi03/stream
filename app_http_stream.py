@@ -11,6 +11,7 @@ import os
 import json
 import sys
 import shutil
+import subprocess
 
 # ========== 强制 RTSP over TCP ==========
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -26,20 +27,11 @@ CONFIG_FILE = "camera_config.json"
 
 
 def get_cert_files():
-    """
-    获取证书文件路径，优先级：
-    1. 当前运行目录下已有的 cert.pem / key.pem
-    2. 如果程序被打包（PyInstaller），从解压的临时目录复制到当前目录
-    返回 (cert_path, key_path) 或 (None, None)
-    """
+    """获取证书文件路径（同原来）"""
     cert_path = "cert.pem"
     key_path = "key.pem"
-
-    # 1. 当前目录已有
     if os.path.exists(cert_path) and os.path.exists(key_path):
         return cert_path, key_path
-
-    # 2. 从打包的临时目录复制（PyInstaller 的 _MEIPASS）
     if hasattr(sys, '_MEIPASS'):
         bundled_cert = os.path.join(sys._MEIPASS, "cert.pem")
         bundled_key = os.path.join(sys._MEIPASS, "key.pem")
@@ -50,20 +42,38 @@ def get_cert_files():
                 return cert_path, key_path
             except Exception as e:
                 print(f"复制证书失败: {e}")
-
     return None, None
+
+
+def get_ffmpeg_path():
+    """获取 ffmpeg.exe 路径（打包后与 exe 同级或从 _MEIPASS 复制）"""
+    if os.path.exists("ffmpeg.exe"):
+        return "ffmpeg.exe"
+    if hasattr(sys, '_MEIPASS'):
+        bundled = os.path.join(sys._MEIPASS, "ffmpeg.exe")
+        if os.path.exists(bundled):
+            try:
+                shutil.copy2(bundled, "ffmpeg.exe")
+                return "ffmpeg.exe"
+            except Exception as e:
+                print(f"复制 ffmpeg.exe 失败: {e}")
+                return bundled
+    return "ffmpeg.exe"
 
 
 class MultiHttpStreamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("多路摄像头 HTTP/HTTPS 直播流转发服务")
+        self.root.title("多路摄像头 HTTP/HTTPS 直播流转发服务（含音频）")
         self.root.geometry("640x780")
         self.root.resizable(True, True)
 
         self.cameras = []
         self.camera_counter = 0
         self.is_running = False
+
+        # 管理所有活跃的 FFmpeg 子进程（每个请求一个独立进程）
+        self.active_ffmpeg_procs = []   # 元素为 (proc, camera_id)
 
         self.flask_app = Flask(__name__)
         self.flask_thread = None
@@ -83,7 +93,6 @@ class MultiHttpStreamerApp:
         self.port_entry.pack(side="left", padx=(0, 15))
         self.port_entry.insert(0, "8080")
 
-        # HTTPS 开关
         self.use_https_var = ctk.BooleanVar(value=True)
         self.https_check = ctk.CTkCheckBox(control_frame, text="启用 HTTPS (自签名证书)", variable=self.use_https_var,
                                            command=self.on_https_toggle)
@@ -109,7 +118,6 @@ class MultiHttpStreamerApp:
         self.status_label = ctk.CTkLabel(self.main_frame, textvariable=self.status_var, font=ctk.CTkFont(size=11))
         self.status_label.pack(anchor="w", pady=(5, 0))
 
-        # 提示标签
         self.hint_var = ctk.StringVar(value="提示：启用 HTTPS 时，首次访问若浏览器显示警告，请点击“高级”->“继续访问”")
         self.hint_label = ctk.CTkLabel(self.main_frame, textvariable=self.hint_var, font=ctk.CTkFont(size=10),
                                        text_color="orange")
@@ -118,7 +126,6 @@ class MultiHttpStreamerApp:
         # 加载配置
         self.load_config()
 
-    # ---------- HTTPS 切换 ----------
     def on_https_toggle(self):
         if self.use_https_var.get():
             self.hint_var.set("提示：启用 HTTPS 时，首次访问若浏览器显示警告，请点击“高级”->“继续访问”")
@@ -126,23 +133,69 @@ class MultiHttpStreamerApp:
             self.hint_var.set("使用 HTTP（不加密，适合局域网/本机）")
         self.update_camera_url_display()
 
-    # ---------- Flask 路由 ----------
+    # ---------- Flask 路由（核心改动：添加 CORS 支持） ----------
     def setup_flask_routes(self):
+        # ---- 添加跨域响应头 ----
+        @self.flask_app.after_request
+        def add_cors_headers(response):
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+            return response
+
+        # 主路由：视频流
         @self.flask_app.route('/stream/<int:camera_id>')
         def video_feed(camera_id):
-            def generate_frames():
-                while True:
-                    frame_bytes = None
-                    for cam in self.cameras:
-                        if cam['camera_id'] == camera_id and cam['running']:
-                            frame_bytes = cam['frame_bytes']
+            # 查找对应摄像头
+            target_cam = None
+            for cam in self.cameras:
+                if cam['camera_id'] == camera_id:
+                    target_cam = cam
+                    break
+            if not target_cam:
+                return "Camera not found", 404
+
+            rtsp_url = target_cam['url_entry'].get().strip()
+            if not rtsp_url:
+                return "RTSP URL empty", 400
+
+            def generate_ts():
+                ffmpeg = get_ffmpeg_path()
+                cmd = [
+                    ffmpeg,
+                    '-rtsp_transport', 'tcp',
+                    '-i', rtsp_url,
+                    '-c:v', 'copy',
+                    '-c:a', 'aac',
+                    '-b:a', '64k',
+                    '-f', 'mpegts',
+                    '-'
+                ]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=4096)
+                self.active_ffmpeg_procs.append((proc, camera_id))
+                try:
+                    while True:
+                        data = proc.stdout.read(4096)
+                        if not data:
                             break
-                    if frame_bytes is not None:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                    else:
-                        time.sleep(0.1)
-            return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+                        yield data
+                except GeneratorExit:
+                    pass
+                except Exception as e:
+                    print(f"Stream {camera_id} error: {e}")
+                finally:
+                    try:
+                        self.active_ffmpeg_procs.remove((proc, camera_id))
+                    except ValueError:
+                        pass
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+
+            return Response(generate_ts(), mimetype='video/MP2T')
 
     # ---------- 配置持久化 ----------
     def save_config(self):
@@ -225,7 +278,6 @@ class MultiHttpStreamerApp:
             'card': card,
             'running': False,
             'cap': None,
-            'frame_bytes': None,
             'thread': None,
             '_img': None,
         }
@@ -240,6 +292,24 @@ class MultiHttpStreamerApp:
         self.save_config()
 
     def remove_camera(self, card, cam_id):
+        # 终止该摄像头所有活跃的 FFmpeg 进程
+        to_remove = []
+        for proc, cid in self.active_ffmpeg_procs:
+            if cid == cam_id:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                to_remove.append((proc, cid))
+        for item in to_remove:
+            try:
+                self.active_ffmpeg_procs.remove(item)
+            except ValueError:
+                pass
+
+        # 停止预览
         for cam in self.cameras:
             if cam['camera_id'] == cam_id:
                 cam['running'] = False
@@ -247,8 +317,10 @@ class MultiHttpStreamerApp:
                     cam['cap'].release()
                 cam['_img'] = None
                 break
+
         self.cameras = [cam for cam in self.cameras if cam['camera_id'] != cam_id]
         card.destroy()
+
         if not self.cameras and self.is_running:
             self.stop_all()
         self.save_config()
@@ -274,7 +346,7 @@ class MultiHttpStreamerApp:
                 cam['url_display'].insert(0, url)
                 cam['url_display'].configure(state="readonly")
 
-    # ---------- 预览线程（自动重连） ----------
+    # ---------- 预览线程 ----------
     def _preview_loop(self, cam_data):
         url = cam_data['url_entry'].get().strip()
         if not url:
@@ -315,10 +387,6 @@ class MultiHttpStreamerApp:
                     else:
                         fail_count = 0
 
-                    ret_encode, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                    if ret_encode:
-                        cam_data['frame_bytes'] = buffer.tobytes()
-
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     img = Image.fromarray(frame_rgb)
                     img.thumbnail((200, 120), Image.Resampling.LANCZOS)
@@ -351,7 +419,6 @@ class MultiHttpStreamerApp:
             cam_data['cap'].release()
             cam_data['cap'] = None
         cam_data['running'] = False
-        cam_data['frame_bytes'] = None
         cam_data['_img'] = None
         self.root.after(0, lambda lbl=cam_data['preview_label']: lbl.configure(image=None, text="已停止"))
 
@@ -402,7 +469,7 @@ class MultiHttpStreamerApp:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         protocol = "HTTPS" if self.use_https_var.get() else "HTTP"
-        self.status_var.set(f"状态: 已启动 {protocol}，端口 {port}，共 {len(self.cameras)} 路流")
+        self.status_var.set(f"状态: 已启动 {protocol}，端口 {port}，共 {len(self.cameras)} 路流（含音频）")
         self.update_camera_url_display()
         self.save_config()
 
@@ -415,8 +482,18 @@ class MultiHttpStreamerApp:
 
     # ---------- 停止所有流 ----------
     def stop_all(self):
+        for proc, _ in self.active_ffmpeg_procs[:]:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self.active_ffmpeg_procs.clear()
+
         for cam in self.cameras:
             self._stop_single_camera(cam)
+
         self.is_running = False
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
@@ -427,6 +504,14 @@ class MultiHttpStreamerApp:
     # ---------- 关闭窗口 ----------
     def on_closing(self):
         self.save_config()
+        for proc, _ in self.active_ffmpeg_procs[:]:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self.active_ffmpeg_procs.clear()
         for cam in self.cameras:
             cam['running'] = False
             if cam['cap']:
